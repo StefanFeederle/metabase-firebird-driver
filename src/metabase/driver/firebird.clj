@@ -103,16 +103,55 @@
 (defmethod sql-jdbc.sync/database-type->base-type :firebird [_ database-type]
   (database-type->base-type database-type))
 
-;; Use "FIRST" instead of "LIMIT"
-(defmethod sql.qp/apply-top-level-clause [:firebird :limit] [_ _ honeysql-form {value :limit}]
-    (assoc honeysql-form :modifiers [(format "FIRST %d" value)]))
 
-;; Use "SKIP" instead of "OFFSET"
-(defmethod sql.qp/apply-top-level-clause [:firebird :page] [_ _ honeysql-form {{:keys [items page]} :page}]
-  (assoc honeysql-form :modifiers [(format "FIRST %d SKIP %d"
-                                           items
-                                           (* items (dec page)))]))
+;(defmethod sql.qp/apply-top-level-clause [:firebird :limit]
+;  [_driver _top-level-clause honeysql-form {value :limit}]
+;  (-> honeysql-form
+;      (dissoc :select)
+;      (assoc :select-top (into [(sql.qp/inline-num value)] (:select honeysql-form)))))
 
+;; Firebird  LIMIT  →  SELECT FIRST n …
+;(defmethod sql.qp/apply-top-level-clause [:firebird :limit]
+;  [ _driver _clause honeysql-form {value :limit}]
+;  (-> honeysql-form
+;      (dissoc :select)
+;      (assoc :select-top (into [(sql.qp/inline-num value)] (:select honeysql-form)))
+;      (dissoc :limit)))                        ; suppress trailing LIMIT
+
+
+;; ────────────────────────────────────────────────────────────
+;;  LIMIT n   →  SELECT (FIRST n)
+;; ────────────────────────────────────────────────────────────
+(defmethod sql.qp/apply-top-level-clause [:firebird :limit]
+  [_driver _clause honeysql-form {n :limit}]
+  (-> honeysql-form
+      (update :select                          ; prepend raw token
+              (fnil #(into [{:raw (str "FIRST " n)}] %) []))
+      (dissoc :limit)))                        ; suppress trailing LIMIT
+
+;; ────────────────────────────────────────────────────────────
+;;  PAGE    →  SELECT FIRST items SKIP offset …
+;; ────────────────────────────────────────────────────────────
+(defmethod sql.qp/apply-top-level-clause [:firebird :page]
+  [_driver _clause honeysql-form {{:keys [items page]} :page}]
+  (let [offset (* items (dec page))]
+    (-> honeysql-form
+        (update :select
+                (fnil #(into [{:raw (str "FIRST " items " SKIP " offset)}] %) []))
+        (dissoc :limit :offset))))              ; suppress LIMIT/OFFSET
+
+;; ────────────────────────────────────────────────────────────
+;;  Formatter – convert First(n) to FIRST n
+;; ────────────────────────────────────────────────────────────
+(defmethod sql.qp/format-honeysql :firebird
+ [_driver honeysql-form]
+ (let [formatted (sql.qp/format-honeysql :sql-jdbc honeysql-form)]
+   (if (vector? formatted)
+     (let [[sql & params] formatted
+           ;; Replace FIRST(n) with FIRST n
+           firebird-sql (str/replace sql #"SELECT\s+\(FIRST\s+(\d+)\)," "SELECT FIRST $1 ")]
+       (into [firebird-sql] params))
+     formatted)))
 
 ;; When selecting constants Firebird doesn't check privileges, we have to select all fields
 (defn simple-select-probe-query
