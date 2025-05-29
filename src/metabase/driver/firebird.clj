@@ -312,7 +312,9 @@
     [:dateadd [:raw (name unit)] amount hsql-form]))
 
 (defmethod sql.qp/current-datetime-honeysql-form :firebird [_]
-  (hx/cast :timestamp (hx/literal :now)))
+  [:metabase.util.honey-sql-2/typed
+   [:cast [:metabase.util.honey-sql-2/literal "now"] [:raw "timestamp"]]
+   {:database-type "timestamp"}])
 
 (defmethod sql.qp/->honeysql [:firebird :stddev]
   [driver [_ field]]
