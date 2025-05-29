@@ -140,18 +140,19 @@
                 (fnil #(into [{:raw (str "FIRST " items " SKIP " offset)}] %) []))
         (dissoc :limit :offset))))              ; suppress LIMIT/OFFSET
 
-;; ────────────────────────────────────────────────────────────
-;;  Formatter – convert First(n) to FIRST n
-;; ────────────────────────────────────────────────────────────
-(defmethod sql.qp/format-honeysql :firebird
- [_driver honeysql-form]
- (let [formatted (sql.qp/format-honeysql :sql-jdbc honeysql-form)]
-   (if (vector? formatted)
-     (let [[sql & params] formatted
-           ;; Replace FIRST(n) with FIRST n
-           firebird-sql (str/replace sql #"SELECT\s+\(FIRST\s+(\d+)\)," "SELECT FIRST $1 ")]
-       (into [firebird-sql] params))
-     formatted)))
+;; Override the honeysql formatting to catch all extract operations at the SQL generation level
+(defmethod sql.qp/format-honeysql :firebird [_driver honeysql-form]
+  (let [formatted (sql.qp/format-honeysql :sql-jdbc honeysql-form)]
+    (if (vector? formatted)
+      (let [[sql & params] formatted
+            ;; Replace FIRST(n) with FIRST n 
+            firebird-sql (str/replace sql #"SELECT\s+\(FIRST\s+(\d+)\)," "SELECT FIRST $1 ")
+            ;; Fix EXTRACT syntax: EXTRACT("UNIT", expr) -> EXTRACT(UNIT FROM expr)
+            firebird-sql (str/replace firebird-sql #"EXTRACT\s*\(\s*\"([^\"]+)\"\s*,\s*([^)]+)\)" "EXTRACT($1 FROM $2)")
+            ;; Also fix any unquoted EXTRACT issues
+            firebird-sql (str/replace firebird-sql #"EXTRACT\s*\(\s*([A-Z]+)\s*,\s*([^)]+)\)" "EXTRACT($1 FROM $2)")]
+        (into [firebird-sql] params))
+      formatted)))
 
 ;; When selecting constants Firebird doesn't check privileges, we have to select all fields
 (defn simple-select-probe-query
