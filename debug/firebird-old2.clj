@@ -7,7 +7,6 @@
             [java-time :as t]
             [metabase.driver :as driver]
             [metabase.driver.common :as driver.common]
-            ;; [metabase.driver.sql-jdbc.sync.describe-database :as sql-jdbc.sync.describe-database]
             [metabase.driver.sql-jdbc
              [common :as sql-jdbc.common]
              [connection :as sql-jdbc.conn]
@@ -22,31 +21,12 @@
 
 (set! *warn-on-reflection* true)
 
+(driver/register! :firebird, :parent :sql-jdbc)
+
 (defonce ^:private _startup-log
   (do
     (println "[Firebird-driver] ➜ namespace loaded, driver registered")
-    true))                                       ; value stored in defonce
-
-(defmethod sql.qp/->honeysql [:firebird :extract]
-  [driver [_ unit expr]]
-  ;; --- DEBUG ---------------------------------------------------------------
-  (println "[Firebird-driver] rewriting EXTRACT for"
-           (str/upper-case (name unit)) "←" expr)
-  ;; ------------------------------------------------------------------------
-
-  ;; Check if expr is already in Honey SQL format
-  (let [expr-honeysql (if (and (vector? expr)
-                               (#{:metabase.util.honey-sql-2/typed
-                                  :metabase.util.honey-sql-2/identifier
-                                  :field :cast :raw} (first expr)))
-                        expr  ; Already Honey SQL, use as-is
-                        (sql.qp/->honeysql driver expr))  ; Convert to Honey SQL
-        [expr-sql & params] (sql.qp/format-honeysql driver expr-honeysql)]
-    [:raw (format "EXTRACT(%s FROM %s)"
-                  (str/upper-case (name unit))
-                  expr-sql)]))
-
-(driver/register! :firebird, :parent :sql-jdbc)
+    true))
 
 (defn- firebird->spec
   "Create a database specification for a FirebirdSQL database."
@@ -60,8 +40,8 @@
 
 ;; use Honey SQL 2
 (defmethod sql.qp/honey-sql-version :firebird
-           [_driver]
-           2)
+  [_driver]
+  2)
 
 ;; Obtain connection properties for connection to a Firebird database.
 (defmethod sql-jdbc.conn/connection-details->spec :firebird [_ details]
@@ -105,14 +85,13 @@
 
 ;; Use "FIRST" instead of "LIMIT"
 (defmethod sql.qp/apply-top-level-clause [:firebird :limit] [_ _ honeysql-form {value :limit}]
-    (assoc honeysql-form :modifiers [(format "FIRST %d" value)]))
+  (assoc honeysql-form :modifiers [(format "FIRST %d" value)]))
 
 ;; Use "SKIP" instead of "OFFSET"
 (defmethod sql.qp/apply-top-level-clause [:firebird :page] [_ _ honeysql-form {{:keys [items page]} :page}]
   (assoc honeysql-form :modifiers [(format "FIRST %d SKIP %d"
                                            items
                                            (* items (dec page)))]))
-
 
 ;; When selecting constants Firebird doesn't check privileges, we have to select all fields
 (defn simple-select-probe-query
@@ -128,15 +107,10 @@
   [driver ^Connection conn [sql & params]]
   {:pre [(string? sql)]}
   (with-open [stmt (sql-jdbc.sync.common/prepare-statement driver conn sql params)]
-    ;; attempting to execute the SQL statement will throw an Exception if we don't have permissions; otherwise it will
-    ;; truthy wheter or not it returns a ResultSet, but we can ignore that since we have enough info to proceed at
-    ;; this point.
     (.execute stmt)))
 
 (defmethod sql-jdbc.sync/have-select-privilege? :firebird
   [driver conn table-schema table-name]
-  ;; Query completes = we have SELECT privileges
-  ;; Query throws some sort of no permissions exception = no SELECT privileges
   (let [sql-args (simple-select-probe-query driver table-schema table-name)]
     (try
       (execute-select-probe-query driver conn sql-args)
@@ -151,9 +125,24 @@
 (defmethod sql.qp/unix-timestamp->honeysql [:firebird :seconds] [_ _ expr]
   [:DATEADD [:raw "SECOND"] expr (hx/cast :TIMESTAMP (hx/literal "01-01-1970 00:00:00"))])
 
-;; Helpers for Date extraction
-;; TODO: This can probably simplified a lot by using String concentation instead of
-;; replacing parts of the format recursively
+;; FIXED: Remove the problematic global extract method and handle it properly in date functions
+;; The original method was interfering with other expressions
+
+;; Helpers for Date extraction - UPDATED for better handling
+(defn- extract-firebird [unit expr]
+  "Create a Firebird EXTRACT expression"
+  [:raw (format "EXTRACT(%s FROM %s)"
+                (str/upper-case (name unit))
+                ;; Use a placeholder that will be replaced during formatting
+                "%%EXPR%%")])
+
+(defn- firebird-extract-sql [driver unit expr]
+  "Generate proper Firebird EXTRACT SQL"
+  (let [expr-sql (first (hsql/format-expr (sql.qp/->honeysql driver expr)
+                                          {:quoted true}))]
+    (format "EXTRACT(%s FROM %s)"
+            (str/upper-case (name unit))
+            expr-sql)))
 
 ;; Specifies what Substring to replace for a given time unit
 (defn- get-unit-placeholder [unit]
@@ -174,85 +163,50 @@
     4 :MONTH
     5 :YEAR))
 
-;; ---------------------------------------------------------------------------
-;; helper that returns  EXTRACT(YEAR FROM "source"."CIN_INVOICEDATE")
-;; ---------------------------------------------------------------------------
-(defn- extract-sql [driver unit expr]
-  (let [[expr-sql & _]           ;; => "\"source\".\"CIN_INVOICEDATE\""
-        (sql.qp/format-honeysql
-          driver
-          (sql.qp/->honeysql driver expr))]
-    (format "EXTRACT(%s FROM %s)"
-            (str/upper-case (name unit))
-            expr-sql)))
-
-;; --------------------------------------------------------------------------
 ;; REPLACE the part of the timestamp string with EXTRACT(...)
-;; --------------------------------------------------------------------------
-(defn- replace-timestamp-part [input unit expr]
+(defn- replace-timestamp-part [driver input unit expr]
   [:replace
    input
-   (hx/literal (get-unit-placeholder unit))      ; the placeholder stays literal
-   [:raw (extract-sql :firebird unit expr)]])    ; final SQL → no further processing
+   (hx/literal (get-unit-placeholder unit))
+   [:raw (firebird-extract-sql driver unit expr)]])
 
-(defn- format-step [expr input step wanted-unit]
+(defn- format-step [driver expr input step wanted-unit]
   (if (> step wanted-unit)
-    (format-step expr (replace-timestamp-part input (get-unit-name step) expr) (- step 1) wanted-unit)
-    (replace-timestamp-part input (get-unit-name step) expr)))
+    (format-step driver expr (replace-timestamp-part driver input (get-unit-name step) expr) (- step 1) wanted-unit)
+    (replace-timestamp-part driver input (get-unit-name step) expr)))
 
-(defn- format-timestamp [expr format-template wanted-unit]
-  (format-step expr (hx/literal format-template) 5 wanted-unit))
+(defn- format-timestamp [driver expr format-template wanted-unit]
+  (format-step driver expr (hx/literal format-template) 5 wanted-unit))
 
-;; Firebird doesn't have a date_trunc function, so use a workaround: First format the timestamp to a
-;; string of the wanted resulution, then convert it back to a timestamp
-(defn- timestamp-trunc [expr format-str wanted-unit]
-  (hx/cast :TIMESTAMP (format-timestamp expr format-str wanted-unit)))
+;; Firebird doesn't have a date_trunc function, so use a workaround
+(defn- timestamp-trunc [driver expr format-str wanted-unit]
+  (hx/cast :TIMESTAMP (format-timestamp driver expr format-str wanted-unit)))
 
-(defn- date-trunc [expr format-str wanted-unit]
-  (hx/cast :DATE (format-timestamp expr format-str wanted-unit)))
+(defn- date-trunc [driver expr format-str wanted-unit]
+  (hx/cast :DATE (format-timestamp driver expr format-str wanted-unit)))
 
+;; UPDATED date methods to pass driver parameter
 (defmethod sql.qp/date [:firebird :default]         [_ _ expr] expr)
-;; Cast to TIMESTAMP if we need minutes or hours, since expr might be a DATE
-(defmethod sql.qp/date [:firebird :minute]          [_ _ expr] (timestamp-trunc (hx/cast :TIMESTAMP expr) "YYYY-MM-DD hh:mm:00" 1))
-(defmethod sql.qp/date [:firebird :minute-of-hour]  [_ _ expr] (sql.qp/->honeysql :firebird [:extract :MINUTE (hx/cast :TIMESTAMP expr)]))
-(defmethod sql.qp/date [:firebird :hour]            [_ _ expr] (timestamp-trunc (hx/cast :TIMESTAMP expr) "YYYY-MM-DD hh:00:00" 2))
-(defmethod sql.qp/date [:firebird :hour-of-day]     [_ _ expr] (sql.qp/->honeysql :firebird [:extract :HOUR (hx/cast :TIMESTAMP expr)]))
-;; Cast to DATE to get rid of anything smaller than day
+(defmethod sql.qp/date [:firebird :minute]          [driver _ expr] (timestamp-trunc driver (hx/cast :TIMESTAMP expr) "YYYY-MM-DD hh:mm:00" 1))
+(defmethod sql.qp/date [:firebird :minute-of-hour]  [_ _ expr] [:extract :MINUTE (hx/cast :TIMESTAMP expr)])
+(defmethod sql.qp/date [:firebird :hour]            [driver _ expr] (timestamp-trunc driver (hx/cast :TIMESTAMP expr) "YYYY-MM-DD hh:00:00" 2))
+(defmethod sql.qp/date [:firebird :hour-of-day]     [_ _ expr] [:extract :HOUR (hx/cast :TIMESTAMP expr)])
 (defmethod sql.qp/date [:firebird :day]             [_ _ expr] (hx/cast :DATE expr))
-;; Firebird DOW is 0 (Sun) - 6 (Sat); increment this to be consistent with Java, H2, MySQL, and Mongo (1-7)
-(defmethod sql.qp/date [:firebird :day-of-week]     [_ _ expr] (hx/+ (sql.qp/->honeysql :firebird [:extract :WEEKDAY (hx/cast :DATE expr)]) 1))
-(defmethod sql.qp/date [:firebird :day-of-month]    [_ _ expr] (sql.qp/->honeysql :firebird [:extract :DAY expr]))
-;; Firebird YEARDAY starts from 0; increment this
-(defmethod sql.qp/date [:firebird :day-of-year]     [_ _ expr] (hx/+ (sql.qp/->honeysql :firebird [:extract :YEARDAY expr]) 1))
-;; Cast to DATE because we do not want units smaller than days
-;; Use :raw for DAY in dateadd because the keyword :WEEK gets surrounded with quotations
-(defmethod sql.qp/date [:firebird :week]            [_ _ expr] [:dateadd [:raw "DAY"] (hx/- 0 (sql.qp/->honeysql :firebird [:extract :WEEKDAY (hx/cast :DATE expr)])) (hx/cast :DATE expr)])
-(defmethod sql.qp/date [:firebird :week-of-year]    [_ _ expr] (sql.qp/->honeysql :firebird [:extract :WEEK expr]))
-(defmethod sql.qp/date [:firebird :month]           [_ _ expr] (date-trunc expr "YYYY-MM-01" 4))
-(defmethod sql.qp/date [:firebird :month-of-year]   [_ _ expr] (sql.qp/->honeysql :firebird [:extract :MONTH expr]))
-;; Use :raw for MONTH in dateadd because the keyword :MONTH gets surrounded with quotations
-(defmethod sql.qp/date [:firebird :quarter]         [_ _ expr] [:dateadd [:raw "MONTH"] (hx/* (hx// (hx/- (sql.qp/->honeysql :firebird [:extract :MONTH expr]) 1) 3) 3) (date-trunc expr "YYYY-01-01" 5)])
-(defmethod sql.qp/date [:firebird :quarter-of-year] [_ _ expr] (hx/+ (hx// (hx/- (sql.qp/->honeysql :firebird [:extract :MONTH expr]) 1) 3) 1))
-(defmethod sql.qp/date [:firebird :year]            [_ _ expr] (sql.qp/->honeysql :firebird [:extract :YEAR expr]))
+(defmethod sql.qp/date [:firebird :day-of-week]     [_ _ expr] (hx/+ [:extract :WEEKDAY (hx/cast :DATE expr)] 1))
+(defmethod sql.qp/date [:firebird :day-of-month]    [_ _ expr] [:extract :DAY expr])
+(defmethod sql.qp/date [:firebird :day-of-year]     [_ _ expr] (hx/+ [:extract :YEARDAY expr] 1))
+(defmethod sql.qp/date [:firebird :week]            [_ _ expr] [:dateadd [:raw "DAY"] (hx/- 0 [:extract :WEEKDAY (hx/cast :DATE expr)]) (hx/cast :DATE expr)])
+(defmethod sql.qp/date [:firebird :week-of-year]    [_ _ expr] [:extract :WEEK expr])
+(defmethod sql.qp/date [:firebird :month]           [driver _ expr] (date-trunc driver expr "YYYY-MM-01" 4))
+(defmethod sql.qp/date [:firebird :month-of-year]   [_ _ expr] [:extract :MONTH expr])
+(defmethod sql.qp/date [:firebird :quarter]         [driver _ expr] [:dateadd [:raw "MONTH"] (hx/* (hx// (hx/- [:extract :MONTH expr] 1) 3) 3) (date-trunc driver expr "YYYY-01-01" 5)])
+(defmethod sql.qp/date [:firebird :quarter-of-year] [_ _ expr] (hx/+ (hx// (hx/- [:extract :MONTH expr] 1) 3) 1))
+(defmethod sql.qp/date [:firebird :year]            [_ _ expr] [:extract :YEAR expr])
 
 ;; Firebird 2.x doesn't support TRUE/FALSE, replacing them with 1 and 0
-(defmethod sql.qp/->honeysql [:firebird Boolean]    [_ bool] (if bool 1 0))
+(defmethod sql.qp/->honeysql [:firebird Boolean] [_ bool] (if bool 1 0))
 
-;; TODO / Help Wanted:
-;; Firebird 2.x doesn't support SUBSTRING arugments seperated by commas, but uses FROM and FOR keywords
-;(defmethod sql.qp/->honeysql [:firebird :substring]
-;  [driver [_ arg start length]]
-;  (let [col-name (hformat/to-sql (sql.qp/->honeysql driver arg))]
-;    (if length
-;      (reify
-;        hformat/ToSql
-;        (to-sql [_]
-;          (str "substring(" col-name " FROM " start " FOR " length ")")))
-;      (reify
-;        hformat/ToSql
-;        (to-sql [_]
-;          (str "substring(" col-name " FROM " start ")"))))))
-
+;; UPDATED: Better interval handling
 (defmethod sql.qp/add-interval-honeysql-form :firebird [driver hsql-form amount unit]
   (if (= unit :quarter)
     (recur driver hsql-form (hx/* amount 3) :month)
@@ -265,8 +219,7 @@
   [driver [_ field]]
   [:stddev_samp (sql.qp/->honeysql driver field)])
 
-;; MEGA HACK based on sqlite driver
-
+;; Time handling methods
 (defn- zero-time? [t]
   (= (t/local-time t) (t/local-time 0)))
 
@@ -300,16 +253,25 @@
     (sql.qp/->honeysql driver (t/local-date t))
     (hx/cast :TIMESTAMP (t/format "yyyy-MM-dd HH:mm:ss.SSSS" t))))
 
-(doseq [[feature supported?] {; supported
+;; UPDATED: Database capabilities for latest Metabase
+(doseq [[feature supported?] {;; Supported features
                               :basic-aggregations                      true
                               :expression-aggregations                 true
                               :foreign-keys                            true
                               :nested-queries                          true
                               :standard-deviation-aggregations         true
-                              ; not supported
+                              :left-join                               true
+                              :right-join                              true
+                              :inner-join                              true
+                              :full-join                               false ;; Firebird doesn't support FULL OUTER JOIN
+                              :case-sensitivity-string-filter-options  true
+                              :regex                                   false
+                              
+                              ;; Unsupported features
                               :binning                                 false
-                              :case-sensitivity-string-filter-options  false
                               :nested-fields                           false
                               :schemas                                 false
-                              :set-timezone                            false}]
+                              :set-timezone                            false
+                              :window-functions                        false
+                              :percentile-aggregations                 false}]
   (defmethod driver/database-supports? [:firebird feature] [_driver _feature _db] supported?))

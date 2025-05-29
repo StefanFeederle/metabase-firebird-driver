@@ -102,7 +102,7 @@
 ;; Map Firebird data types to base types
 (defmethod sql-jdbc.sync/database-type->base-type :firebird [_ database-type]
   (database-type->base-type database-type))
-
+  
 ;; Use "FIRST" instead of "LIMIT"
 (defmethod sql.qp/apply-top-level-clause [:firebird :limit] [_ _ honeysql-form {value :limit}]
     (assoc honeysql-form :modifiers [(format "FIRST %d" value)]))
@@ -112,7 +112,6 @@
   (assoc honeysql-form :modifiers [(format "FIRST %d SKIP %d"
                                            items
                                            (* items (dec page)))]))
-
 
 ;; When selecting constants Firebird doesn't check privileges, we have to select all fields
 (defn simple-select-probe-query
